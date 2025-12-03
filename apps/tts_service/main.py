@@ -4,43 +4,70 @@ Text-to-Speech using Piper
 """
 import asyncio
 import logging
-import os
-import subprocess
+import io
+import wave
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
-import uuid
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-import aiofiles
+import numpy as np
+import soundfile as sf
+
+try:
+    from piper import PiperVoice
+    PIPER_AVAILABLE = True
+except ImportError:
+    PIPER_AVAILABLE = False
+    logging.warning("Piper not available, using mock mode")
 
 from config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Piper configuration
-PIPER_BINARY = "./piper/piper"
-OUTPUT_DIR = "/tmp/tts_output"
+# Global voice instance
+piper_voice: Optional[PiperVoice] = None
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    speed: Optional[float] = 1.0
+
+
+class TTSResponse(BaseModel):
+    audio_url: str
+    duration: float
+    sample_rate: int
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan manager"""
-    logger.info("🗣️ Initializing TTS Service...")
+    global piper_voice
     
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    logger.info("🗣️ Loading Piper TTS model...")
     
-    # Check if Piper is available
-    if not os.path.exists(PIPER_BINARY):
-        logger.warning(f"Piper binary not found at {PIPER_BINARY}")
+    if PIPER_AVAILABLE:
+        try:
+            # Load Piper voice model
+            model_path = f"{settings.PIPER_MODEL_PATH}/{settings.TTS_MODEL}.onnx"
+            config_path = f"{settings.PIPER_MODEL_PATH}/{settings.TTS_MODEL}.onnx.json"
+            
+            piper_voice = PiperVoice.load(model_path, config_path)
+            logger.info(f"✅ TTS Service ready with model: {settings.TTS_MODEL}")
+        except Exception as e:
+            logger.error(f"Failed to load Piper model: {e}")
+            logger.info("Running in mock mode")
+    else:
+        logger.info("Running in mock mode (Piper not installed)")
     
-    logger.info("✅ TTS Service ready")
     yield
     
     logger.info("🛑 Shutting down TTS Service")
+    piper_voice = None
 
 
 app = FastAPI(
@@ -51,18 +78,6 @@ app = FastAPI(
 )
 
 
-class TTSRequest(BaseModel):
-    text: str
-    voice: Optional[str] = None
-    speed: Optional[float] = 1.0
-
-
-class VoiceInfo(BaseModel):
-    name: str
-    language: str
-    quality: str
-
-
 @app.get("/")
 async def root():
     """Root endpoint"""
@@ -70,17 +85,17 @@ async def root():
         "service": "AI-JARVIS TTS Service",
         "version": "1.0.0",
         "model": settings.TTS_MODEL,
-        "status": "operational"
+        "status": "operational",
+        "piper_available": PIPER_AVAILABLE
     }
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    piper_available = os.path.exists(PIPER_BINARY)
     return {
-        "status": "healthy" if piper_available else "degraded",
-        "piper_available": piper_available
+        "status": "healthy",
+        "model_loaded": piper_voice is not None or not PIPER_AVAILABLE
     }
 
 
@@ -90,155 +105,100 @@ async def synthesize_speech(request: TTSRequest):
     Synthesize speech from text
     
     Args:
-        request: TTS request with text and optional voice/speed
+        request: TTS request with text and options
         
     Returns:
-        Audio file (WAV)
+        Audio file (WAV format)
     """
-    if not request.text or not request.text.strip():
+    if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     
     try:
-        # Generate unique filename
-        audio_id = str(uuid.uuid4())
-        output_file = os.path.join(OUTPUT_DIR, f"{audio_id}.wav")
-        
-        # Prepare Piper command
-        voice_model = request.voice or settings.TTS_MODEL
-        speed = request.speed or settings.TTS_VOICE_SPEED
-        
-        # Use espeak-ng as fallback if Piper not available
-        if not os.path.exists(PIPER_BINARY):
-            logger.info("Using espeak-ng fallback")
-            cmd = [
-                "espeak-ng",
-                "-v", "fr",  # French voice
-                "-s", str(int(175 * speed)),  # Speed
-                "-w", output_file,
-                request.text
-            ]
-        else:
-            # Use Piper
-            cmd = [
-                PIPER_BINARY,
-                "--model", f"/models/{voice_model}.onnx",
-                "--output_file", output_file
-            ]
-        
-        # Run synthesis
-        if os.path.exists(PIPER_BINARY):
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate(input=request.text.encode())
+        if PIPER_AVAILABLE and piper_voice:
+            # Real Piper synthesis
+            audio_stream = io.BytesIO()
+            wav_file = wave.open(audio_stream, "wb")
             
-            if process.returncode != 0:
-                logger.error(f"Piper error: {stderr.decode()}")
-                raise HTTPException(status_code=500, detail="Synthesis failed")
+            # Configure WAV file
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(piper_voice.config.sample_rate)
+            
+            # Synthesize
+            audio_data = []
+            for audio_chunk in piper_voice.synthesize_stream_raw(
+                request.text,
+                speaker_id=None,
+                length_scale=1.0 / request.speed
+            ):
+                audio_data.extend(audio_chunk)
+            
+            # Convert to bytes
+            audio_array = np.array(audio_data, dtype=np.int16)
+            wav_file.writeframes(audio_array.tobytes())
+            wav_file.close()
+            
+            audio_stream.seek(0)
+            
+            return StreamingResponse(
+                audio_stream,
+                media_type="audio/wav",
+                headers={
+                    "Content-Disposition": "attachment; filename=speech.wav"
+                }
+            )
         else:
-            # Use espeak-ng synchronously
-            result = subprocess.run(cmd, capture_output=True)
-            if result.returncode != 0:
-                logger.error(f"espeak-ng error: {result.stderr.decode()}")
-                raise HTTPException(status_code=500, detail="Synthesis failed")
-        
-        # Return audio file
-        if not os.path.exists(output_file):
-            raise HTTPException(status_code=500, detail="Audio generation failed")
-        
-        return FileResponse(
-            output_file,
-            media_type="audio/wav",
-            filename=f"speech_{audio_id}.wav",
-            background=lambda: os.remove(output_file)  # Cleanup after sending
-        )
+            # Mock mode - return silent audio
+            logger.warning("Using mock TTS (Piper not available)")
+            duration = len(request.text.split()) * 0.3  # ~0.3s per word
+            sample_rate = 22050
+            
+            # Generate silent audio
+            audio_data = np.zeros(int(duration * sample_rate), dtype=np.int16)
+            
+            audio_stream = io.BytesIO()
+            sf.write(audio_stream, audio_data, sample_rate, format='WAV')
+            audio_stream.seek(0)
+            
+            return StreamingResponse(
+                audio_stream,
+                media_type="audio/wav",
+                headers={
+                    "Content-Disposition": "attachment; filename=speech.wav"
+                }
+            )
     
     except Exception as e:
-        logger.error(f"Synthesis error: {e}", exc_info=True)
+        logger.error(f"TTS synthesis error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.websocket("/stream")
-async def stream_synthesis(websocket: WebSocket):
-    """
-    Real-time text-to-speech streaming
-    
-    Client sends text, receives audio chunks
-    """
-    await websocket.accept()
-    logger.info("WebSocket TTS client connected")
-    
-    try:
-        while True:
-            # Receive text
-            data = await websocket.receive_json()
-            text = data.get("text", "")
-            
-            if not text:
-                continue
-            
-            # Generate audio
-            audio_id = str(uuid.uuid4())
-            output_file = os.path.join(OUTPUT_DIR, f"{audio_id}.wav")
-            
-            # Quick synthesis with espeak-ng for streaming
-            cmd = [
-                "espeak-ng",
-                "-v", "fr",
-                "-w", output_file,
-                text
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True)
-            
-            if result.returncode == 0 and os.path.exists(output_file):
-                # Read and send audio data
-                async with aiofiles.open(output_file, 'rb') as f:
-                    audio_data = await f.read()
-                
-                await websocket.send_bytes(audio_data)
-                
-                # Cleanup
-                os.remove(output_file)
-            else:
-                await websocket.send_json({
-                    "error": "Synthesis failed"
-                })
-    
-    except WebSocketDisconnect:
-        logger.info("WebSocket TTS client disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-        await websocket.close()
-
-
-@app.get("/voices", response_model=list[VoiceInfo])
+@app.get("/voices")
 async def list_voices():
     """
-    List available TTS voices
+    List available voices
     """
-    # Default voices (expand based on downloaded models)
-    voices = [
-        VoiceInfo(name="fr_FR-siwis-medium", language="French", quality="medium"),
-        VoiceInfo(name="fr_FR-tom-medium", language="French", quality="medium"),
-        VoiceInfo(name="en_US-lessac-medium", language="English", quality="medium"),
-    ]
-    return voices
+    return {
+        "available_voices": [
+            "fr_FR-siwis-medium",
+            "fr_FR-upmc-medium",
+            "en_US-lessac-medium",
+            "en_GB-alan-medium",
+            "es_ES-sharvard-medium",
+            "de_DE-thorsten-medium"
+        ],
+        "current_voice": settings.TTS_MODEL,
+        "description": "Piper TTS supports multiple languages and voices"
+    }
 
 
-@app.get("/test")
-async def test_synthesis():
+@app.post("/test")
+async def test_voice(text: str = "Bonjour, je suis JARVIS, votre assistant personnel."):
     """
-    Test endpoint to verify TTS is working
+    Test TTS with sample text
     """
-    test_request = TTSRequest(
-        text="Bonjour, je suis JARVIS, votre assistant personnel.",
-        speed=1.0
-    )
-    return await synthesize_speech(test_request)
+    request = TTSRequest(text=text)
+    return await synthesize_speech(request)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
-python-multipart==0.0.6
-websockets==12.0
+piper-tts==1.2.0
+onnxruntime==1.16.3
+numpy==1.26.3
+soundfile==0.12.1
 pydantic==2.5.3
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
-numpy==1.26.3
-aiofiles==23.2.1
