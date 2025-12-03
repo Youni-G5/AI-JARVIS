@@ -1,9 +1,7 @@
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
+docker==7.0.0
 pydantic==2.5.3
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
-docker==7.0.0
-paho-mqtt==1.6.1
-pyautogui==0.9.54
-psutil==5.9.8
+pyYAML==6.0.1

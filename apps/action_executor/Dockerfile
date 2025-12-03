@@ -4,8 +4,9 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    curl \
     docker.io \
+    curl \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
