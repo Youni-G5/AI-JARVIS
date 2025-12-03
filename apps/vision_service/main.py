@@ -1,23 +1,22 @@
 """
 AI-JARVIS Vision Service
-Computer vision with YOLOv8 and OCR
+Computer vision with YOLOv8 + OCR
 """
 import asyncio
 import logging
-import os
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional, List, Dict, Any
 import io
 import base64
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator, Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import cv2
 import numpy as np
-from ultralytics import YOLO
-import pytesseract
 from PIL import Image
+import pytesseract
+from ultralytics import YOLO
 
 from config import settings
 
@@ -28,45 +27,16 @@ logger = logging.getLogger(__name__)
 yolo_model: Optional[YOLO] = None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator:
-    """Application lifespan manager"""
-    global yolo_model
-    
-    logger.info("👁️ Loading Vision models...")
-    
-    # Load YOLO model
-    try:
-        model_path = f"/models/{settings.YOLO_MODEL}"
-        if not os.path.exists(model_path):
-            logger.warning(f"YOLO model not found at {model_path}, downloading...")
-            yolo_model = YOLO(settings.YOLO_MODEL)  # Will auto-download
-        else:
-            yolo_model = YOLO(model_path)
-        
-        logger.info(f"✅ YOLO model loaded: {settings.YOLO_MODEL}")
-    except Exception as e:
-        logger.error(f"Failed to load YOLO model: {e}")
-        yolo_model = None
-    
-    logger.info("✅ Vision Service ready")
-    yield
-    
-    logger.info("🛑 Shutting down Vision Service")
-
-
-app = FastAPI(
-    title="AI-JARVIS Vision Service",
-    description="Computer vision service with YOLOv8 and OCR",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-
 class DetectionResult(BaseModel):
-    label: str
+    class_name: str
     confidence: float
     bbox: List[float]  # [x1, y1, x2, y2]
+
+
+class VisionResponse(BaseModel):
+    detections: List[DetectionResult]
+    image_size: tuple
+    processing_time: float
 
 
 class OCRResult(BaseModel):
@@ -75,11 +45,41 @@ class OCRResult(BaseModel):
     bbox: Optional[List[int]] = None
 
 
-class VisionResponse(BaseModel):
-    detections: List[DetectionResult]
-    ocr_results: List[OCRResult]
-    image_size: List[int]  # [width, height]
-    processing_time: float
+class OCRResponse(BaseModel):
+    full_text: str
+    blocks: List[OCRResult]
+    language: str
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator:
+    """Application lifespan manager"""
+    global yolo_model
+    
+    logger.info("👁️ Loading YOLO model...")
+    
+    try:
+        # Load YOLO model
+        model_path = f"/models/{settings.YOLO_MODEL}"
+        yolo_model = YOLO(model_path)
+        logger.info(f"✅ Vision Service ready with {settings.YOLO_MODEL}")
+    except Exception as e:
+        logger.error(f"Failed to load YOLO model: {e}")
+        logger.info("Vision service will use default model")
+        yolo_model = YOLO("yolov8n.pt")  # Fallback to nano model
+    
+    yield
+    
+    logger.info("🛑 Shutting down Vision Service")
+    yolo_model = None
+
+
+app = FastAPI(
+    title="AI-JARVIS Vision Service",
+    description="Computer vision and OCR service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
@@ -88,7 +88,7 @@ async def root():
     return {
         "service": "AI-JARVIS Vision Service",
         "version": "1.0.0",
-        "yolo_model": settings.YOLO_MODEL,
+        "model": settings.YOLO_MODEL,
         "ocr_enabled": settings.ENABLE_OCR,
         "status": "operational"
     }
@@ -99,24 +99,24 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "yolo_loaded": yolo_model is not None,
+        "model_loaded": yolo_model is not None,
         "ocr_available": settings.ENABLE_OCR
     }
 
 
-@app.post("/detect")
+@app.post("/detect", response_model=VisionResponse)
 async def detect_objects(image: UploadFile = File(...)):
     """
-    Detect objects in image using YOLOv8
+    Detect objects in image using YOLO
     
     Args:
-        image: Image file (jpg, png, etc.)
+        image: Image file
         
     Returns:
-        Detection results with bounding boxes and labels
+        Detection results with bounding boxes and confidences
     """
     if yolo_model is None:
-        raise HTTPException(status_code=503, detail="YOLO model not loaded")
+        raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
         import time
@@ -131,39 +131,45 @@ async def detect_objects(image: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Invalid image")
         
         # Run detection
-        results = yolo_model(img, conf=settings.YOLO_CONFIDENCE)
+        results = yolo_model.predict(
+            img,
+            conf=settings.YOLO_CONFIDENCE,
+            verbose=False
+        )
         
         # Parse results
         detections = []
         for result in results:
             boxes = result.boxes
             for box in boxes:
+                # Get box coordinates
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-                confidence = float(box.conf[0])
+                
+                # Get class and confidence
                 class_id = int(box.cls[0])
-                label = yolo_model.names[class_id]
+                confidence = float(box.conf[0])
+                class_name = result.names[class_id]
                 
                 detections.append(DetectionResult(
-                    label=label,
+                    class_name=class_name,
                     confidence=confidence,
                     bbox=[x1, y1, x2, y2]
                 ))
         
         processing_time = time.time() - start_time
         
-        return {
-            "detections": detections,
-            "ocr_results": [],
-            "image_size": [img.shape[1], img.shape[0]],
-            "processing_time": processing_time
-        }
+        return VisionResponse(
+            detections=detections,
+            image_size=img.shape[:2],
+            processing_time=processing_time
+        )
     
     except Exception as e:
         logger.error(f"Detection error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/ocr")
+@app.post("/ocr", response_model=OCRResponse)
 async def extract_text(image: UploadFile = File(...)):
     """
     Extract text from image using OCR
@@ -178,46 +184,49 @@ async def extract_text(image: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="OCR not enabled")
     
     try:
-        import time
-        start_time = time.time()
-        
         # Read image
         image_data = await image.read()
         img = Image.open(io.BytesIO(image_data))
         
-        # Run OCR
+        # Run OCR with detailed output
         ocr_data = pytesseract.image_to_data(
             img,
             lang=settings.TESSERACT_LANG,
             output_type=pytesseract.Output.DICT
         )
         
-        # Parse results
-        ocr_results = []
-        n_boxes = len(ocr_data['text'])
+        # Extract full text
+        full_text = pytesseract.image_to_string(
+            img,
+            lang=settings.TESSERACT_LANG
+        )
         
+        # Parse blocks with confidence > 0
+        blocks = []
+        n_boxes = len(ocr_data['text'])
         for i in range(n_boxes):
             text = ocr_data['text'][i].strip()
-            if text:
-                confidence = float(ocr_data['conf'][i]) / 100.0
-                x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
+            conf = float(ocr_data['conf'][i])
+            
+            if text and conf > 0:
+                bbox = [
+                    ocr_data['left'][i],
+                    ocr_data['top'][i],
+                    ocr_data['width'][i],
+                    ocr_data['height'][i]
+                ]
                 
-                ocr_results.append(OCRResult(
+                blocks.append(OCRResult(
                     text=text,
-                    confidence=confidence,
-                    bbox=[x, y, x+w, y+h]
+                    confidence=conf / 100.0,  # Convert to 0-1 scale
+                    bbox=bbox
                 ))
         
-        processing_time = time.time() - start_time
-        
-        # Combine all text
-        full_text = " ".join([r.text for r in ocr_results])
-        
-        return {
-            "full_text": full_text,
-            "ocr_results": ocr_results,
-            "processing_time": processing_time
-        }
+        return OCRResponse(
+            full_text=full_text.strip(),
+            blocks=blocks,
+            language=settings.TESSERACT_LANG
+        )
     
     except Exception as e:
         logger.error(f"OCR error: {e}", exc_info=True)
@@ -225,9 +234,9 @@ async def extract_text(image: UploadFile = File(...)):
 
 
 @app.post("/analyze")
-async def analyze_image(image: UploadFile = File(...)):
+async def analyze_scene(image: UploadFile = File(...)):
     """
-    Complete image analysis: object detection + OCR
+    Complete scene analysis: object detection + OCR
     
     Args:
         image: Image file
@@ -235,126 +244,56 @@ async def analyze_image(image: UploadFile = File(...)):
     Returns:
         Combined detection and OCR results
     """
-    if yolo_model is None:
-        raise HTTPException(status_code=503, detail="YOLO model not loaded")
-    
     try:
-        import time
-        start_time = time.time()
-        
-        # Read image
+        # Read image once
         image_data = await image.read()
-        nparr = np.frombuffer(image_data, np.uint8)
-        img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        # Object detection
-        results = yolo_model(img_cv, conf=settings.YOLO_CONFIDENCE)
-        detections = []
-        
-        for result in results:
-            boxes = result.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
-                label = yolo_model.names[class_id]
-                
-                detections.append(DetectionResult(
-                    label=label,
-                    confidence=confidence,
-                    bbox=[x1, y1, x2, y2]
-                ))
-        
-        # OCR
-        ocr_results = []
-        if settings.ENABLE_OCR:
-            img_pil = Image.open(io.BytesIO(image_data))
-            ocr_data = pytesseract.image_to_data(
-                img_pil,
-                lang=settings.TESSERACT_LANG,
-                output_type=pytesseract.Output.DICT
-            )
-            
-            n_boxes = len(ocr_data['text'])
-            for i in range(n_boxes):
-                text = ocr_data['text'][i].strip()
-                if text:
-                    confidence = float(ocr_data['conf'][i]) / 100.0
-                    x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
-                    
-                    ocr_results.append(OCRResult(
-                        text=text,
-                        confidence=confidence,
-                        bbox=[x, y, x+w, y+h]
-                    ))
-        
-        processing_time = time.time() - start_time
-        
-        return VisionResponse(
-            detections=detections,
-            ocr_results=ocr_results,
-            image_size=[img_cv.shape[1], img_cv.shape[0]],
-            processing_time=processing_time
+        # Create UploadFile objects for each service
+        detection_image = UploadFile(
+            filename=image.filename,
+            file=io.BytesIO(image_data)
         )
+        ocr_image = UploadFile(
+            filename=image.filename,
+            file=io.BytesIO(image_data)
+        )
+        
+        # Run detection and OCR concurrently
+        detection_task = detect_objects(detection_image)
+        ocr_task = extract_text(ocr_image) if settings.ENABLE_OCR else None
+        
+        if ocr_task:
+            detection_result, ocr_result = await asyncio.gather(
+                detection_task,
+                ocr_task,
+                return_exceptions=True
+            )
+        else:
+            detection_result = await detection_task
+            ocr_result = None
+        
+        return {
+            "detection": detection_result if not isinstance(detection_result, Exception) else {"error": str(detection_result)},
+            "ocr": ocr_result if not isinstance(ocr_result, Exception) else {"error": str(ocr_result)},
+            "status": "complete"
+        }
     
     except Exception as e:
-        logger.error(f"Analysis error: {e}", exc_info=True)
+        logger.error(f"Scene analysis error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.websocket("/stream")
-async def stream_video_analysis(websocket: WebSocket):
-    """
-    Real-time video stream analysis
-    
-    Client sends video frames, receives detection results
-    """
-    await websocket.accept()
-    logger.info("WebSocket vision client connected")
-    
-    try:
-        while True:
-            # Receive frame
-            data = await websocket.receive_bytes()
-            
-            # Decode frame
-            nparr = np.frombuffer(data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            if frame is None:
-                continue
-            
-            # Run detection
-            if yolo_model:
-                results = yolo_model(frame, conf=settings.YOLO_CONFIDENCE, verbose=False)
-                
-                detections = []
-                for result in results:
-                    boxes = result.boxes
-                    for box in boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        confidence = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        label = yolo_model.names[class_id]
-                        
-                        detections.append({
-                            "label": label,
-                            "confidence": confidence,
-                            "bbox": [x1, y1, x2, y2]
-                        })
-                
-                # Send results
-                await websocket.send_json({
-                    "type": "detections",
-                    "detections": detections,
-                    "count": len(detections)
-                })
-    
-    except WebSocketDisconnect:
-        logger.info("WebSocket vision client disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-        await websocket.close()
+@app.get("/models")
+async def list_models():
+    """List available YOLO models"""
+    return {
+        "available_models": [
+            "yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
+            "yolov8l.pt", "yolov8x.pt"
+        ],
+        "current_model": settings.YOLO_MODEL,
+        "description": "YOLOv8 models from nano to extra-large"
+    }
 
 
 if __name__ == "__main__":

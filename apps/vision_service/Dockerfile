@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    libgomp1 \
     tesseract-ocr \
     tesseract-ocr-fra \
     tesseract-ocr-eng \
@@ -25,7 +24,7 @@ COPY . .
 
 EXPOSE 8004
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8004/health || exit 1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004"]
