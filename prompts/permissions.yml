@@ -1,0 +1,82 @@
+# Permission rules for JARVIS actions
+# Format: tool_name: {level: low|medium|high|critical, requires_confirmation: bool}
+
+system_actions:
+  open_app:
+    level: low
+    requires_confirmation: false
+    allowed_apps: ["firefox", "chrome", "vscode", "terminal"]
+    
+  close_app:
+    level: low
+    requires_confirmation: false
+    
+  execute_command:
+    level: critical
+    requires_confirmation: true
+    blacklist: ["rm -rf", "dd if=", "mkfs", "format"]
+    
+  file_read:
+    level: medium
+    requires_confirmation: false
+    
+  file_write:
+    level: high
+    requires_confirmation: true
+    restricted_paths: ["/etc", "/sys", "/root"]
+    
+  file_delete:
+    level: critical
+    requires_confirmation: true
+    
+  screenshot:
+    level: low
+    requires_confirmation: false
+    
+  send_notification:
+    level: low
+    requires_confirmation: false
+    
+  control_volume:
+    level: low
+    requires_confirmation: false
+    
+  search_web:
+    level: low
+    requires_confirmation: false
+
+iot_actions:
+  toggle_light:
+    level: low
+    requires_confirmation: false
+    
+  set_temperature:
+    level: medium
+    requires_confirmation: false
+    max_temp: 30
+    min_temp: 15
+    
+  lock_door:
+    level: high
+    requires_confirmation: true
+    
+  unlock_door:
+    level: critical
+    requires_confirmation: true
+    
+  trigger_alarm:
+    level: critical
+    requires_confirmation: true
+
+query_actions:
+  weather:
+    level: low
+    requires_confirmation: false
+    
+  calendar:
+    level: low
+    requires_confirmation: false
+    
+  reminder:
+    level: low
+    requires_confirmation: false
