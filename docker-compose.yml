@@ -1,0 +1,223 @@
+version: '3.9'
+
+services:
+  # ==========================================
+  # Core Orchestrator
+  # ==========================================
+  orchestrator:
+    build:
+      context: ./apps/orchestrator_core
+      dockerfile: Dockerfile
+    container_name: jarvis_orchestrator
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./apps/orchestrator_core:/app
+      - ./prompts:/prompts
+      - logs:/var/log/jarvis
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+      - chromadb
+    networks:
+      - jarvis_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================
+  # STT Service (Whisper)
+  # ==========================================
+  stt_service:
+    build:
+      context: ./apps/stt_service
+      dockerfile: Dockerfile
+    container_name: jarvis_stt
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./models/whisper:/models
+    ports:
+      - "8001:8001"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # TTS Service (Piper)
+  # ==========================================
+  tts_service:
+    build:
+      context: ./apps/tts_service
+      dockerfile: Dockerfile
+    container_name: jarvis_tts
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./models/piper:/models
+    ports:
+      - "8002:8002"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # LLM Agent (Ollama)
+  # ==========================================
+  llm_agent:
+    build:
+      context: ./apps/llm_agent
+      dockerfile: Dockerfile
+    container_name: jarvis_llm
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./prompts:/prompts
+      - ollama_data:/root/.ollama
+    ports:
+      - "8003:8003"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # Vision Service (YOLOv8 + OCR)
+  # ==========================================
+  vision_service:
+    build:
+      context: ./apps/vision_service
+      dockerfile: Dockerfile
+    container_name: jarvis_vision
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./models/yolo:/models
+    ports:
+      - "8004:8004"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # Memory Service (ChromaDB)
+  # ==========================================
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: jarvis_memory
+    restart: unless-stopped
+    volumes:
+      - chromadb_data:/chroma/chroma
+    ports:
+      - "8005:8000"
+    networks:
+      - jarvis_network
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+  # ==========================================
+  # Action Executor
+  # ==========================================
+  action_executor:
+    build:
+      context: ./apps/action_executor
+      dockerfile: Dockerfile
+    container_name: jarvis_executor
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./sandbox:/sandbox
+    ports:
+      - "8006:8006"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # Bridge API (Unified Gateway)
+  # ==========================================
+  bridge_api:
+    build:
+      context: ./apps/bridge_api
+      dockerfile: Dockerfile
+    container_name: jarvis_bridge
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8007:8007"
+    depends_on:
+      - orchestrator
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # Frontend (Next.js)
+  # ==========================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jarvis_frontend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - bridge_api
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # PostgreSQL (Persistent Storage)
+  # ==========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: jarvis_postgres
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # Redis (Caching & Pub/Sub)
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: jarvis_redis
+    restart: unless-stopped
+    command: redis-server --requirepass changeme
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - jarvis_network
+
+  # ==========================================
+  # Ollama (LLM Backend)
+  # ==========================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: jarvis_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - jarvis_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  chromadb_data:
+  ollama_data:
+  logs:
+
+networks:
+  jarvis_network:
+    driver: bridge
