@@ -1,0 +1,62 @@
+# Prometheus Configuration for AI-JARVIS
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'ai-jarvis'
+    environment: 'production'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them
+rule_files:
+  # - "alert_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Orchestrator metrics
+  - job_name: 'orchestrator'
+    static_configs:
+      - targets: ['orchestrator:8000']
+    metrics_path: '/metrics'
+  
+  # STT Service
+  - job_name: 'stt_service'
+    static_configs:
+      - targets: ['stt_service:8001']
+  
+  # TTS Service
+  - job_name: 'tts_service'
+    static_configs:
+      - targets: ['tts_service:8002']
+  
+  # LLM Agent
+  - job_name: 'llm_agent'
+    static_configs:
+      - targets: ['llm_agent:8003']
+  
+  # Vision Service
+  - job_name: 'vision_service'
+    static_configs:
+      - targets: ['vision_service:8004']
+  
+  # Action Executor
+  - job_name: 'action_executor'
+    static_configs:
+      - targets: ['action_executor:8006']
+  
+  # Bridge API
+  - job_name: 'bridge_api'
+    static_configs:
+      - targets: ['bridge_api:8007']
+  
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
